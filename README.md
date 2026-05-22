@@ -50,6 +50,16 @@ Scope boundaries:
 
 > New in v2.0.0: Added native edgeless canvas tools and shipped a slimmer 84-tool public surface with least-privilege profiles for read-only, core, and authoring deployments.
 
+### Canonical doc-link form (`affine://doc/<docId>`)
+
+Workspace-internal links round-trip through markdown using the URI scheme `affine://doc/<docId>`. This matches the existing `affine://blob/<sourceId>` precedent and parses as a standard URL through any third-party markdown processor.
+
+**Writing**: any `[Title](affine://doc/<docId>)` in `append_markdown` or `create_doc_from_markdown` produces a clickable inline `LinkedPage` reference — not a card embed view. The same form on a paragraph of its own also produces an inline reference, never auto-promoting to an `affine:embed-linked-doc` card. The explicit `append_block` write path with `type: "embed_linked_doc"` likewise produces a paragraph containing one inline reference, so agents see one consistent block shape regardless of which write surface they used.
+
+**Reading**: `read_doc` surfaces a structured `references: [{from, to, pageId, title}]` array on every text-bearing block (paragraphs, headings, lists, quotes, callouts, table cells with a `cellId` discriminator, database row titles, edgeless text). `affine:embed-linked-doc` card blocks (created via the AFFiNE UI's drag-drop affordance) surface their target with `pageId` and `linkedTitle` on the block row. `list_children` enumerates a doc's outgoing links with a `kind: "embed" | "inline"` discriminator and `sourceBlockId` so agents can traverse the workspace graph.
+
+**Side effect**: external `[text](url)` markdown links also round-trip cleanly through write → read now (previously the renderer stripped link attributes, leaving bare text).
+
 ## Choose Your Path
 | Goal | Start here |
 | --- | --- |

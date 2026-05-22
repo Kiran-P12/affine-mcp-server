@@ -360,11 +360,19 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
    * Build a Y.Text containing a LinkedPage reference delta.
    * This is the mechanism AFFiNE uses to associate a database row with a
    * linked doc that opens in "center peek" when the row title is clicked.
+   * After spec 009 it is also the mechanism the markdown adapter and the
+   * `embed_linked_doc` write path use to render workspace-internal links
+   * (`affine://doc/<docId>`) as clickable inline references.
    */
-  function makeLinkedDocText(docId: string): Y.Text {
-    const delta = [{ insert: "\u200B", attributes: { reference: { type: "LinkedPage", pageId: docId } } }];
-    // Cast needed: TextDelta.attributes doesn't declare `reference`, but
-    // makeText spreads all attributes at runtime via `{ ...delta.attributes }`.
+  function makeLinkedDocText(docId: string, title?: string | null): Y.Text {
+    const reference: { type: "LinkedPage"; pageId: string; title?: string } = {
+      type: "LinkedPage",
+      pageId: docId,
+    };
+    if (typeof title === "string" && title.length > 0) {
+      reference.title = title;
+    }
+    const delta = [{ insert: "\u200B", attributes: { reference } }];
     return makeText(delta as TextDelta[]);
   }
 
@@ -383,6 +391,46 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
     }
     return null;
+  }
+
+  /**
+   * Walk a Y.Text's deltas and enumerate every inline LinkedPage reference
+   * with its character span. Used by read_doc / list_children / search_content
+   * to surface inline reference targets to MCP callers.
+   *
+   * Returns one entry per reference delta, in source order. Each entry's
+   * [from, to) is a half-open character range over the rendered text content
+   * (the same indexing model the MCP client sees in `block.text`).
+   */
+  function walkInlineReferences(
+    yText: unknown
+  ): Array<{ from: number; to: number; pageId: string; title: string | null }> {
+    if (!(yText instanceof Y.Text)) return [];
+    const delta = yText.toDelta();
+    if (!Array.isArray(delta)) return [];
+    const out: Array<{ from: number; to: number; pageId: string; title: string | null }> = [];
+    let offset = 0;
+    for (const d of delta) {
+      const insert = typeof d.insert === "string" ? d.insert : "";
+      const length = insert.length;
+      const ref = d.attributes?.reference;
+      if (
+        ref &&
+        typeof ref === "object" &&
+        ref.type === "LinkedPage" &&
+        typeof ref.pageId === "string" &&
+        ref.pageId.length > 0
+      ) {
+        out.push({
+          from: offset,
+          to: offset + length,
+          pageId: ref.pageId,
+          title: typeof ref.title === "string" ? ref.title : null,
+        });
+      }
+      offset += length;
+    }
+    return out;
   }
 
   function asText(value: unknown): string {
@@ -1870,20 +1918,20 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         return { blockId, block, flavour: "affine:embed-html" };
       }
       case "embed_linked_doc": {
-        setSysFields(block, blockId, "affine:embed-linked-doc");
+        // Spec 009 FR-001/FR-010: the agent `embed_linked_doc` write path
+        // (whether invoked explicitly via `append_block` or routed here from
+        // the markdown-form standalone canonical link) materializes as a
+        // paragraph block whose Y.Text contains a single LinkedPage reference
+        // delta — never an `affine:embed-linked-doc` card embed view. The
+        // bracketed link text becomes the cached reference title. Card embed
+        // views remain a human-only affordance via the AFFiNE UI's drop
+        // affordance, unchanged by this feature.
+        setSysFields(block, blockId, "affine:paragraph");
         block.set("sys:parent", null);
         block.set("sys:children", new Y.Array<string>());
-        block.set("prop:index", "a0");
-        block.set("prop:xywh", "[0,0,0,0]");
-        block.set("prop:lockedBySelf", false);
-        block.set("prop:rotate", 0);
-        block.set("prop:style", "horizontal");
-        block.set("prop:caption", normalized.caption ?? null);
-        block.set("prop:pageId", normalized.pageId);
-        block.set("prop:title", undefined);
-        block.set("prop:description", undefined);
-        block.set("prop:footnoteIdentifier", null);
-        return { blockId, block, flavour: "affine:embed-linked-doc" };
+        block.set("prop:type", "text");
+        block.set("prop:text", makeLinkedDocText(normalized.pageId, normalized.caption ?? null));
+        return { blockId, block, flavour: "affine:paragraph", blockType: "text" };
       }
       case "embed_synced_doc": {
         setSysFields(block, blockId, "affine:embed-synced-doc");
@@ -2360,6 +2408,32 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           strict,
           placement,
         };
+      case "embed_linked_doc":
+        // Per spec 009 FR-001/FR-014: a markdown-parsed `embed_linked_doc`
+        // operation (paragraph-alone canonical link form) is materialized as a
+        // paragraph block whose Y.Text contains a single LinkedPage reference
+        // delta — never an `affine:embed-linked-doc` card. Card embed views
+        // remain a human-only affordance via the AFFiNE UI's drop affordance.
+        return {
+          workspaceId,
+          docId,
+          type: "paragraph",
+          text: operation.caption ?? "",
+          deltas: [
+            {
+              insert: "\u200B",
+              attributes: {
+                reference: {
+                  type: "LinkedPage",
+                  pageId: operation.pageId,
+                  title: operation.caption ?? null,
+                },
+              },
+            },
+          ],
+          strict,
+          placement,
+        };
       default: {
         const exhaustiveCheck: never = operation;
         throw new Error(`Unsupported markdown operation type: ${(exhaustiveCheck as any).type}`);
@@ -2578,10 +2652,18 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const childIds = childIdsFrom(block.get("sys:children"));
+      const flavourValue = asStringOrNull(block.get("sys:flavour"));
+      const propText = block.get("prop:text");
+      // Spec 009 FR-003: capture Y.Text deltas (with reference attributes) so
+      // the renderer can emit canonical link forms instead of plain text.
+      const deltas =
+        propText instanceof Y.Text
+          ? (propText.toDelta() as TextDelta[])
+          : undefined;
       const entry: MarkdownRenderableBlock = {
         id: blockId,
         parentId: asStringOrNull(block.get("sys:parent")),
-        flavour: asStringOrNull(block.get("sys:flavour")),
+        flavour: flavourValue,
         type: asStringOrNull(block.get("prop:type")),
         text: asText(block.get("prop:text")) || null,
         checked: typeof block.get("prop:checked") === "boolean" ? Boolean(block.get("prop:checked")) : null,
@@ -2590,7 +2672,15 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         url: asStringOrNull(block.get("prop:url")),
         sourceId: asStringOrNull(block.get("prop:sourceId")),
         caption: asStringOrNull(block.get("prop:caption")),
-        tableData: block.get("sys:flavour") === "affine:table" ? extractTableData(block) : null,
+        tableData: flavourValue === "affine:table" ? extractTableData(block) : null,
+        ...(deltas && deltas.length > 0 ? { deltas } : {}),
+        // Spec 009 FR-004: surface embed-linked-doc card targets.
+        ...(flavourValue === "affine:embed-linked-doc"
+          ? {
+              pageId: asStringOrNull(block.get("prop:pageId")) ?? undefined,
+              linkedTitle: asStringOrNull(block.get("prop:title")) ?? undefined,
+            }
+          : {}),
       };
       blocksById.set(blockId, entry);
 
@@ -4499,6 +4589,16 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         checked: boolean | null;
         language: string | null;
         childIds: string[];
+        // Spec 009 FR-003: structured inline-reference list for any block
+        // that carries text. Empty array means "we looked and found no
+        // references"; absent means the block has no walkable text payload.
+        // For affine:table blocks, each entry's `cellId` (= `${rowId}:${colId}`)
+        // identifies the cell the reference lives in.
+        references?: Array<{ from: number; to: number; pageId: string; title: string | null; cellId?: string }>;
+        // Spec 009 FR-004: target identifier and cached title for
+        // affine:embed-linked-doc card blocks (human-authored via UI drop).
+        pageId?: string;
+        linkedTitle?: string;
       }> = [];
       const plainTextLines: string[] = [];
       let title = "";
@@ -4513,7 +4613,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         const flavour = raw.get("sys:flavour");
         const parentId = raw.get("sys:parent");
         const type = raw.get("prop:type");
-        const textValue = asText(raw.get("prop:text"));
+        const propText = raw.get("prop:text");
+        const textValue = asText(propText);
         const language = raw.get("prop:language");
         const checked = raw.get("prop:checked");
         const childIds = childIdsFrom(raw.get("sys:children"));
@@ -4525,6 +4626,47 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           plainTextLines.push(textValue);
         }
 
+        // Spec 009 FR-003: walk the Y.Text deltas for any block that carries
+        // text and surface every inline LinkedPage reference with its span
+        // and target identifier. Universal coverage — paragraphs, lists,
+        // quotes, callouts, headings (all share prop:text), edgeless text,
+        // database row titles, plus per-cell coverage for affine:table.
+        let references: Array<{ from: number; to: number; pageId: string; title: string | null; cellId?: string }> | undefined;
+        if (flavour === "affine:table") {
+          // Table cells live as flat dot-keyed Y.Text properties on the
+          // block, e.g. `prop:cells.{rowId}:{colId}.text`. Walk each cell
+          // and tag its references with the cellId so callers can locate
+          // them within the table.
+          const tableRefs: Array<{ from: number; to: number; pageId: string; title: string | null; cellId?: string }> = [];
+          raw.forEach((cellValue: unknown, cellKey: string) => {
+            if (
+              typeof cellKey === "string" &&
+              cellKey.startsWith("prop:cells.") &&
+              cellKey.endsWith(".text") &&
+              cellValue instanceof Y.Text
+            ) {
+              const cellId = cellKey.slice("prop:cells.".length, -".text".length);
+              for (const ref of walkInlineReferences(cellValue)) {
+                tableRefs.push({ ...ref, cellId });
+              }
+            }
+          });
+          references = tableRefs;
+        } else if (propText instanceof Y.Text) {
+          references = walkInlineReferences(propText);
+        }
+
+        // Spec 009 FR-004: for affine:embed-linked-doc cards, surface the
+        // target identifier and cached title from prop:pageId / prop:title.
+        const linkedDocPageId =
+          flavour === "affine:embed-linked-doc"
+            ? (typeof raw.get("prop:pageId") === "string" ? (raw.get("prop:pageId") as string) : undefined)
+            : undefined;
+        const linkedDocTitle =
+          flavour === "affine:embed-linked-doc"
+            ? (typeof raw.get("prop:title") === "string" ? (raw.get("prop:title") as string) : undefined)
+            : undefined;
+
         blockRows.push({
           id: blockId,
           parentId: typeof parentId === "string" ? parentId : null,
@@ -4534,6 +4676,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           checked: typeof checked === "boolean" ? checked : null,
           language: typeof language === "string" ? language : null,
           childIds,
+          ...(references !== undefined ? { references } : {}),
+          ...(linkedDocPageId !== undefined ? { pageId: linkedDocPageId } : {}),
+          ...(linkedDocTitle !== undefined ? { linkedTitle: linkedDocTitle } : {}),
         });
 
         for (const childId of childIds) {
@@ -5753,14 +5898,71 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const doc = new Y.Doc();
       Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
       const blocks = doc.getMap("blocks") as Y.Map<any>;
-      const children: Array<{ docId: string; title: string | null; url: string }> = [];
-      for (const [, raw] of blocks) {
+      const baseUrl = (process.env.AFFINE_BASE_URL || endpoint.replace(/\/graphql\/?$/, "")).replace(/\/$/, "");
+      const buildUrl = (pageId: string) => `${baseUrl}/workspace/${workspaceId}/${pageId}`;
+      // Spec 009 FR-005: list_children covers BOTH block-level embed-linked-doc
+      // cards AND inline LinkedPage references (in any text-bearing block,
+      // including affine:table cells), with a `kind` discriminator and the
+      // sourceBlockId where each reference originated.
+      const children: Array<{
+        kind: "embed" | "inline";
+        sourceBlockId: string;
+        docId: string;
+        title: string | null;
+        url: string;
+        cellId?: string;
+      }> = [];
+      for (const [blockId, raw] of blocks) {
         if (!(raw instanceof Y.Map)) continue;
-        if (raw.get("sys:flavour") !== "affine:embed-linked-doc") continue;
-        const pageId = raw.get("prop:pageId");
-        if (typeof pageId === "string" && pageId) {
-          children.push({ docId: pageId, title: titleById.get(pageId) ?? null,
-            url: `${(process.env.AFFINE_BASE_URL || endpoint.replace(/\/graphql\/?$/, '')).replace(/\/$/, '')}/workspace/${workspaceId}/${pageId}` });
+        const flavour = raw.get("sys:flavour");
+        if (flavour === "affine:embed-linked-doc") {
+          const pageId = raw.get("prop:pageId");
+          if (typeof pageId === "string" && pageId) {
+            children.push({
+              kind: "embed",
+              sourceBlockId: String(blockId),
+              docId: pageId,
+              title: titleById.get(pageId) ?? null,
+              url: buildUrl(pageId),
+            });
+          }
+          continue;
+        }
+        // Inline references on any text-bearing block.
+        const propText = raw.get("prop:text");
+        if (propText instanceof Y.Text) {
+          for (const ref of walkInlineReferences(propText)) {
+            children.push({
+              kind: "inline",
+              sourceBlockId: String(blockId),
+              docId: ref.pageId,
+              title: titleById.get(ref.pageId) ?? ref.title ?? null,
+              url: buildUrl(ref.pageId),
+            });
+          }
+        }
+        // Per-cell coverage for affine:table.
+        if (flavour === "affine:table") {
+          raw.forEach((cellValue: unknown, cellKey: string) => {
+            if (
+              typeof cellKey === "string" &&
+              cellKey.startsWith("prop:cells.") &&
+              cellKey.endsWith(".text") &&
+              cellValue instanceof Y.Text
+            ) {
+              const cellId = cellKey.slice("prop:cells.".length, -".text".length);
+              for (const ref of walkInlineReferences(cellValue)) {
+                children.push({
+                  kind: "inline",
+                  sourceBlockId: String(blockId),
+                  docId: ref.pageId,
+                  title: titleById.get(ref.pageId) ?? ref.title ?? null,
+                  url: buildUrl(ref.pageId),
+                  cellId,
+                });
+              }
+            }
+          });
         }
       }
       return text({ docId: parsed.docId, count: children.length, children });
@@ -5768,7 +5970,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   };
   server.registerTool("list_children", {
     title: "List Document Children",
-    description: "List the direct children of a document in the sidebar (embed_linked_doc blocks). Returns docId, title, and URL for each child.",
+    description: "List a document's outgoing doc links: both block-level embed_linked_doc cards (kind: 'embed') and inline LinkedPage references inside any text-bearing block (kind: 'inline'). Each entry includes docId, title, URL, and the sourceBlockId where the link originated.",
     inputSchema: {
       workspaceId: z.string().optional(),
       docId: z.string().describe("The parent doc whose children to list."),

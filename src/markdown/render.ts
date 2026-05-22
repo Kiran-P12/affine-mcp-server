@@ -1,4 +1,50 @@
-import type { MarkdownRenderResult, MarkdownRenderableBlock } from "./types.js";
+import type { MarkdownRenderResult, MarkdownRenderableBlock, TextDelta } from "./types.js";
+
+/**
+ * Spec 009 FR-006/FR-007/FR-008: walk a block's TextDelta array and emit
+ * markdown that preserves inline formatting and link information that the
+ * old plain-text path silently discarded. In particular:
+ * - LinkedPage reference deltas (insert: "\u200B" + attributes.reference)
+ *   become the canonical link form `[Title](affine://doc/<docId>)`.
+ * - External link deltas (attributes.link) become `[text](url)`.
+ * - bold/italic/strike/code attributes are preserved.
+ * If `deltas` is missing or empty, falls back to `fallback` (the block's
+ * plain-text rendering, retaining the legacy behavior for clients that
+ * haven't populated deltas yet).
+ */
+function renderInlineFromDeltas(deltas: TextDelta[] | undefined, fallback: string): string {
+  if (!deltas || deltas.length === 0) return fallback;
+  const parts: string[] = [];
+  for (const delta of deltas) {
+    if (typeof delta.insert !== "string") continue;
+    const attrs = (delta.attributes ?? {}) as TextDelta["attributes"] & { reference?: { type?: string; pageId?: string; title?: string | null } };
+    const ref = attrs?.reference;
+    if (
+      ref &&
+      typeof ref === "object" &&
+      ref.type === "LinkedPage" &&
+      typeof ref.pageId === "string" &&
+      ref.pageId.length > 0
+    ) {
+      const title =
+        typeof ref.title === "string" && ref.title.length > 0 ? ref.title : "Untitled";
+      parts.push(`[${title}](affine://doc/${ref.pageId})`);
+      continue;
+    }
+    let text = delta.insert;
+    // Inline formatting wrappers, innermost first. Order matches the natural
+    // markdown nesting agents are most likely to produce.
+    if (attrs.code) text = "`" + text + "`";
+    if (attrs.bold) text = `**${text}**`;
+    if (attrs.italic) text = `*${text}*`;
+    if (attrs.strike) text = `~~${text}~~`;
+    if (typeof attrs.link === "string" && attrs.link.length > 0) {
+      text = `[${text}](${attrs.link})`;
+    }
+    parts.push(text);
+  }
+  return parts.join("");
+}
 
 type RenderState = {
   blocksById: Map<string, MarkdownRenderableBlock>;
@@ -93,15 +139,20 @@ function renderBlock(
 
   switch (flavour) {
     case "affine:paragraph": {
+      // Spec 009 FR-006/FR-007: prefer delta-aware rendering when available so
+      // inline references (`[Title](affine://doc/X)`) and external links
+      // (`[text](url)`) survive a markdown round-trip. Falls back to the
+      // legacy plain-text path when block.deltas is missing.
+      const inlineText = renderInlineFromDeltas(block.deltas, text).trim();
       let lines: string[] = [];
 
       if (/^h[1-6]$/.test(type)) {
         const level = Number(type.slice(1));
-        lines = [`${"#".repeat(level)} ${text}`.trimEnd()];
+        lines = [`${"#".repeat(level)} ${inlineText}`.trimEnd()];
       } else if (type === "quote") {
-        lines = formatQuote(text);
+        lines = formatQuote(inlineText);
       } else {
-        lines = [text];
+        lines = [inlineText];
       }
 
       for (const childId of children) {
@@ -125,7 +176,10 @@ function renderBlock(
               ? "- [x]"
               : "- [ ]"
             : "-";
-      const lines: string[] = [`${indent}${marker}${text ? ` ${text}` : ""}`];
+      // Spec 009: delta-aware rendering for list items so a list item
+      // containing `[Title](affine://doc/X)` or `[text](url)` round-trips.
+      const inlineText = renderInlineFromDeltas(block.deltas, text).trim();
+      const lines: string[] = [`${indent}${marker}${inlineText ? ` ${inlineText}` : ""}`];
 
       for (const childId of children) {
         const child = state.blocksById.get(childId);
@@ -221,6 +275,29 @@ function renderBlock(
         }
       }
       return { lines: chunks, isList: false };
+    }
+
+    case "affine:embed-linked-doc": {
+      // Spec 009 FR-006: emit the canonical link form for block-level link
+      // cards instead of the opaque <!-- unsupported --> placeholder. The
+      // canonical form round-trips through the parser back into a paragraph
+      // containing one inline reference (per FR-001/FR-014). Note: this
+      // makes the export lossy on the *kind* dimension (a card on read
+      // becomes an inline reference on re-import) but preserves the link
+      // target identity, which is what callers actually need.
+      if (!block.pageId) {
+        state.unsupportedCount += 1;
+        addWarning(state, `Embed-linked-doc block '${blockId}' had no pageId and was skipped.`);
+        return { lines: [], isList: false };
+      }
+      const title =
+        typeof block.linkedTitle === "string" && block.linkedTitle.length > 0
+          ? block.linkedTitle
+          : "Untitled";
+      return {
+        lines: [`[${title}](affine://doc/${block.pageId})`],
+        isList: false,
+      };
     }
 
     default: {

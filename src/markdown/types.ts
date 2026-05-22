@@ -8,6 +8,11 @@ export type TextDelta = {
     strike?: boolean;
     code?: boolean;
     link?: string;
+    reference?: {
+      type: "LinkedPage";
+      pageId: string;
+      title?: string | null;
+    };
   };
 };
 
@@ -59,6 +64,11 @@ export type MarkdownOperation =
       type: "bookmark";
       url: string;
       caption?: string;
+    }
+  | {
+      type: "embed_linked_doc";
+      pageId: string;
+      caption?: string;
     };
 
 export type MarkdownParseResult = {
@@ -85,6 +95,9 @@ export type MarkdownRenderableBlock = {
   sourceId: string | null;
   caption: string | null;
   tableData: string[][] | null;
+  deltas?: TextDelta[];
+  pageId?: string;
+  linkedTitle?: string;
 };
 
 export type MarkdownRenderResult = {

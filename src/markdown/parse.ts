@@ -18,6 +18,14 @@ const md = new MarkdownIt({
   breaks: false,
 });
 
+/**
+ * Spec 009: canonical workspace-internal link form is
+ * `affine://doc/<docId>` (matching the existing `affine://blob/<sourceId>`
+ * family used for image blobs). This regex is the single recognition point
+ * shared by the inline-link path and the standalone-link path.
+ */
+const CANONICAL_DOC_LINK_REGEX = /^affine:\/\/doc\/([\w-]+)$/;
+
 type ParseState = {
   operations: MarkdownOperation[];
   warnings: string[];
@@ -147,6 +155,28 @@ function renderInline(children: TokenLike[]): TextDelta[] {
           }
           const href = getAttr(token, "href");
           const inner = renderRange(i + 1, close);
+          // Spec 009 FR-001/FR-002/FR-014: when the href is the canonical
+          // workspace-internal link form `affine://doc/<docId>`, emit a
+          // single LinkedPage reference delta in place of the link-attributed
+          // run. Mid-text or paragraph-alone, this always produces a clickable
+          // inline reference — never a card embed view (FR-001 carve-out).
+          const canonicalMatch = href.match(CANONICAL_DOC_LINK_REGEX);
+          if (canonicalMatch) {
+            const pageId = canonicalMatch[1];
+            const innerTitle = deltaToString(inner).trim();
+            output.push({
+              insert: "\u200B",
+              attributes: {
+                reference: {
+                  type: "LinkedPage",
+                  pageId,
+                  title: innerTitle.length > 0 ? innerTitle : null,
+                },
+              },
+            });
+            i = close;
+            break;
+          }
           output.push(...applyAttrs(inner.length > 0 ? inner : [{ insert: href }], { link: href }));
           i = close;
           break;
@@ -505,11 +535,25 @@ function parseTokens(tokens: TokenLike[], start: number, end: number, state: Par
         const children = inline.children ?? [];
         const singleLink = extractSingleLink(children);
         if (singleLink) {
-          state.operations.push({
-            type: "bookmark",
-            url: singleLink.href,
-            caption: singleLink.text,
-          });
+          // Spec 009 FR-014: when the standalone link's href is the canonical
+          // workspace-internal form, emit an `embed_linked_doc` operation
+          // (which the converter materializes as a paragraph containing one
+          // inline reference delta — see FR-001). Other single-link
+          // paragraphs continue to materialize as bookmark blocks.
+          const canonicalMatch = singleLink.href.match(CANONICAL_DOC_LINK_REGEX);
+          if (canonicalMatch) {
+            state.operations.push({
+              type: "embed_linked_doc",
+              pageId: canonicalMatch[1],
+              caption: singleLink.text,
+            });
+          } else {
+            state.operations.push({
+              type: "bookmark",
+              url: singleLink.href,
+              caption: singleLink.text,
+            });
+          }
           i = close + 1;
           break;
         }
