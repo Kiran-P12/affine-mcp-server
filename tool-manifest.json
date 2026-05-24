@@ -71,6 +71,7 @@
     "resolve_comment",
     "revoke_access_token",
     "revoke_doc",
+    "search_content",
     "search_docs",
     "sign_in",
     "update_collection",
